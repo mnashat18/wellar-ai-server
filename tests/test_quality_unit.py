@@ -188,6 +188,74 @@ class QualityUnitTests(unittest.TestCase):
         self.assertTrue(result["media_quality"]["audio"]["usable"])
         self.assertTrue(result["media_quality"]["image"]["usable"])
 
+    def test_degrading_warnings_preserve_usable_evidence_and_reach_quality_result(self):
+        cases = [
+            ("video", "visual_warnings", "video_too_dark", False),
+            ("video", "visual_warnings", "video_blurry", False),
+            ("video", "visual_warnings", "unstable_video", False),
+            ("video", "visual_warnings", "unstable_camera", False),
+            ("video", "visual_warnings", "video_low_resolution", False),
+            ("image", "image_warnings", "image_too_dark", False),
+            ("image", "image_warnings", "image_blurry", False),
+            ("image", "image_warnings", "image_low_resolution", False),
+            ("audio", "audio_warnings", "audio_too_noisy", False),
+            ("audio", "audio_warnings", "audio_too_quiet", True),
+            ("audio", "audio_warnings", "too_much_silence", True),
+            ("audio", "audio_warnings", "audio_clipping", True),
+        ]
+        for modality, warning_key, warning, speech_required in cases:
+            with self.subTest(modality=modality, warning=warning):
+                signals = {
+                    "video": _signal("video", score=0.65),
+                    "voice": _signal("audio", score=0.92),
+                    "camera": _signal("image", score=0.86),
+                }
+                signal_key = {"video": "video", "audio": "voice", "image": "camera"}[modality]
+                signals[signal_key]["details"][warning_key] = [warning]
+
+                result = quality.assess_quality(signals, speech_required=speech_required)
+
+                media = result["media_quality"][modality]
+                self.assertTrue(media["present"])
+                self.assertTrue(media["usable"])
+                self.assertFalse(media["weak"])
+                self.assertIn(warning, media["warnings"])
+                self.assertIn(warning, result["warnings"])
+
+    def test_evidence_blocking_warnings_remain_unusable(self):
+        cases = [
+            ("video", "visual_warnings", "face_not_visible", False),
+            ("video", "visual_warnings", "insufficient_usable_frames", False),
+            ("audio", "audio_warnings", "speech_not_detected", True),
+            ("video", "visual_warnings", "video_too_short", False),
+            ("audio", "audio_warnings", "audio_too_short", False),
+        ]
+        for modality, warning_key, warning, speech_required in cases:
+            with self.subTest(modality=modality, warning=warning):
+                signals = {
+                    "video": _signal("video", score=0.65),
+                    "voice": _signal("audio", score=0.92),
+                    "camera": _signal("image", score=0.86),
+                }
+                signal_key = {"video": "video", "audio": "voice", "image": "camera"}[modality]
+                signals[signal_key]["details"][warning_key] = [warning]
+
+                result = quality.assess_quality(signals, speech_required=speech_required)
+
+                self.assertFalse(result["media_quality"][modality]["usable"])
+                self.assertTrue(result["media_quality"][modality]["present"])
+
+    def test_unreadable_required_analyzer_payload_stays_missing(self):
+        for status in ("corrupt", "error", "unreadable"):
+            with self.subTest(status=status):
+                result = quality.assess_quality({
+                    "video": _signal("video", score=0.9, details_overrides={"status": status}),
+                    "voice": _signal("audio", score=0.9),
+                    "camera": _signal("image", score=0.9),
+                })
+                self.assertFalse(result["media_quality"]["video"]["present"])
+                self.assertFalse(result["media_quality"]["video"]["usable"])
+
     def test_missing_quality_score_and_nonfinite_values_are_unreadable(self):
         cases = [
             ("missing", None),
@@ -269,7 +337,7 @@ class QualityUnitTests(unittest.TestCase):
         self.assertTrue(exact["media_quality"]["audio"]["usable"])
         self.assertTrue(exact["media_quality"]["image"]["usable"])
 
-    def test_disqualifying_warning_prevents_usability(self):
+    def test_degrading_warning_preserves_usability_but_recommends_retake(self):
         result = quality.assess_quality({
             "video": _signal("video", score=0.9, details_overrides={"visual_warnings": ["video_blurry"]}),
             "voice": _signal("audio", score=0.9),
@@ -279,7 +347,9 @@ class QualityUnitTests(unittest.TestCase):
         self.assertEqual(result["status"], "weak")
         self.assertIn("video_blurry", result["warnings"])
         self.assertIn("video_blurry", result["weak_reasons"])
-        self.assertFalse(result["media_quality"]["video"]["usable"])
+        self.assertTrue(result["media_quality"]["video"]["usable"])
+        self.assertFalse(result["media_quality"]["video"]["weak"])
+        self.assertTrue(result["retake_required"])
 
     def test_strong_modality_is_also_usable(self):
         result = quality.assess_quality({

@@ -2658,8 +2658,10 @@ def _required_modality_gate(
     quality_result: dict,
     *,
     timed_out_modalities: list[str],
+    analyzer_error_modalities: list[str] | None = None,
 ) -> tuple[str | None, list[str]]:
     media_quality = quality_result.get("media_quality") or {}
+    analyzer_errors = set(analyzer_error_modalities or [])
     required_modalities: list[str] = []
     for modality, required in [
         ("video", VALIDATION_POLICY.require_video),
@@ -2669,6 +2671,8 @@ def _required_modality_gate(
         if not required:
             continue
         required_modalities.append(modality)
+        if modality in analyzer_errors:
+            return FAILURE_REASON_ANALYSIS_EXCEPTION, required_modalities
         if modality in timed_out_modalities:
             if modality == "audio":
                 return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, required_modalities
@@ -2989,6 +2993,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             terminal_failure_reason, _required_modalities = _required_modality_gate(
                 quality_result,
                 timed_out_modalities=timed_out_modalities,
+                analyzer_error_modalities=analyzer_error_modalities,
             )
             if phrase_failure_reason and terminal_failure_reason is None:
                 terminal_failure_reason = phrase_failure_reason

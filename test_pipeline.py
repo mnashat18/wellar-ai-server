@@ -4073,6 +4073,50 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(required, ["video", "audio"])
         self.assertEqual(reason, main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT)
 
+    def test_required_modality_gate_allows_degraded_video_with_usable_evidence(self):
+        signals = {
+            "video": {"score": 0.65, "details": {"status": "ok", "duration_seconds": 5.0, "visual_quality_score": 0.65, "visual_warnings": ["video_too_dark"]}},
+            "voice": {"score": 0.92, "details": {"status": "ok", "duration_seconds": 4.0, "audio_quality_score": 0.92, "audio_warnings": []}},
+            "camera": {"score": 0.86, "details": {"status": "ok", "image_quality_score": 0.86, "image_warnings": []}},
+        }
+        assessed = main.assess_quality(signals)
+
+        reason, required = main._required_modality_gate(assessed, timed_out_modalities=[])
+
+        self.assertEqual(required, ["video", "audio", "image"])
+        self.assertIsNone(reason)
+        self.assertTrue(assessed["media_quality"]["video"]["usable"])
+        self.assertIn("video_too_dark", assessed["warnings"])
+
+    def test_required_modality_gate_still_blocks_missing_face_evidence(self):
+        signals = {
+            "video": {"score": 0.65, "details": {"status": "ok", "duration_seconds": 5.0, "visual_quality_score": 0.65, "visual_warnings": ["face_not_visible"]}},
+            "voice": {"score": 0.92, "details": {"status": "ok", "duration_seconds": 4.0, "audio_quality_score": 0.92, "audio_warnings": []}},
+            "camera": {"score": 0.86, "details": {"status": "ok", "image_quality_score": 0.86, "image_warnings": []}},
+        }
+        assessed = main.assess_quality(signals)
+
+        reason, _required = main._required_modality_gate(assessed, timed_out_modalities=[])
+
+        self.assertEqual(reason, main.FAILURE_REASON_LOW_QUALITY_MEDIA)
+        self.assertFalse(assessed["media_quality"]["video"]["usable"])
+
+    def test_required_modality_gate_reports_analyzer_error_as_technical_failure(self):
+        quality_result = {
+            "media_quality": {
+                "video": {"present": False, "usable": False},
+                "audio": {"present": True, "usable": True},
+                "image": {"present": True, "usable": True},
+            }
+        }
+        reason, _required = main._required_modality_gate(
+            quality_result,
+            timed_out_modalities=[],
+            analyzer_error_modalities=["video"],
+        )
+
+        self.assertEqual(reason, main.FAILURE_REASON_ANALYSIS_EXCEPTION)
+
     def test_full_multimodal_result_requires_numeric_voice_confidence(self):
         result = {
             "voice_confidence": None,

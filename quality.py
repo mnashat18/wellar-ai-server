@@ -12,6 +12,26 @@ FAILURE_REASON_MISSING_MEDIA = "missing_media"
 _READABLE_STATUSES = {"ok"}
 _STRONG_THRESHOLD = 0.72
 _EVIDENCE_ONLY_WARNINGS = {"sustained_eye_closure"}
+_EVIDENCE_BLOCKING_WARNINGS = {
+    "video": {
+        "insufficient_usable_frames",
+        "subject_not_visible",
+        "face_not_visible",
+        "landmark_detection_failed",
+        "video_too_short",
+        "low_quality_media",
+    },
+    "audio": {
+        "speech_not_detected",
+        "audio_too_short",
+        "low_quality_media",
+    },
+    "image": {
+        "face_not_visible",
+        "subject_not_visible",
+        "low_quality_media",
+    },
+}
 _UNREADABLE_DIAGNOSTIC_WARNINGS = {
     "video_timeout",
     "audio_timeout",
@@ -232,6 +252,10 @@ def _modality_summary(
         quiet_but_usable=quiet_but_usable,
     )
     decision_warnings = [warning for warning in public_warnings if warning in decision_warning_set and warning not in _EVIDENCE_ONLY_WARNINGS]
+    evidence_blocking_warnings = [
+        warning for warning in decision_warnings
+        if warning in _EVIDENCE_BLOCKING_WARNINGS.get(name, set())
+    ]
     public_warnings = clean_warning_codes(public_warnings)
 
     duration = None
@@ -263,7 +287,7 @@ def _modality_summary(
         if not required_duration_keys:
             duration = None
 
-    usable = bool(readable and score is not None and score >= threshold and not decision_warnings)
+    usable = bool(readable and score is not None and score >= threshold and not evidence_blocking_warnings)
     weak = bool(readable and not usable)
     strong = bool(usable and score is not None and score >= _STRONG_THRESHOLD)
 

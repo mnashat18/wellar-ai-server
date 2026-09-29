@@ -309,6 +309,15 @@ class CaptureVsFatigueTests(unittest.TestCase):
         blurry = compute_result(signals=signals)
         self.assertLess(blurry["modality_scores"]["video"], clean["modality_scores"]["video"])
 
+    def test_degrading_video_warning_still_reduces_scored_quality(self):
+        clean = compute_result(signals=_clean_signals())
+        degraded_signals = _clean_signals()
+        degraded_signals["video"] = _ok_video(visual_warnings=["video_too_dark"])
+        degraded = compute_result(signals=degraded_signals)
+
+        self.assertLess(degraded["modality_scores"]["video"], clean["modality_scores"]["video"])
+        self.assertLess(degraded["confidence"], clean["confidence"])
+
 
 # ---------------------------------------------------------------------------
 # 6. speech_rate retirement
