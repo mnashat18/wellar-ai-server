@@ -14,8 +14,10 @@ import time
 import sys
 from multiprocessing.connection import wait as multiprocessing_wait
 from typing import Any
+from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import requests
@@ -37,6 +39,7 @@ from quality import assess_quality
 from scoring import compute_result
 from utils import download_temp_file, is_url, remove_temp_file, safe_number, sanitize_payload, sanitize_text
 from validation import ValidationPolicy, fail_validation, failure_message, validate_scan_inputs
+from durable_config import DurableConfigurationError, DurableSettings, durable_enabled
 
 
 app = FastAPI()
@@ -75,6 +78,9 @@ def _env_positive_float(name: str, default: float) -> float:
 
 
 VALIDATION_POLICY = None if _ANALYZER_CHILD_MODE else ValidationPolicy.from_env()
+DURABLE_PROCESSING_ENABLED = durable_enabled()
+AI_PROCESSING_VERSION = os.getenv("AI_PROCESSING_VERSION", "cie_v1_2").strip() or "cie_v1_2"
+_DURABLE_COORDINATOR = None
 AI_SERVER_ENV = os.getenv("AI_SERVER_ENV", "production").strip().lower()
 DEBUG_SCAN_ENDPOINT_ENABLED = (
     AI_SERVER_ENV in {"dev", "development", "local", "test"}
@@ -266,6 +272,76 @@ class ScanResultResponse(BaseModel):
     reaction_metrics: dict | None = None
     explanation: str
     suggested_action: str
+
+
+class DurableClaimRequest(BaseModel):
+    worker_id: str = Field(..., min_length=1, max_length=255)
+    processing_version: str = Field(..., min_length=1, max_length=100)
+    trace_id: str = Field(..., min_length=1, max_length=255)
+
+    class Config:
+        extra = "forbid"
+
+
+class DurableHeartbeatRequest(BaseModel):
+    worker_id: str = Field(..., min_length=1, max_length=255)
+    lease_token: UUID
+
+    class Config:
+        extra = "forbid"
+
+
+class DurableCommitRequest(BaseModel):
+    scan_id: str = Field(..., min_length=1, max_length=255)
+    processing_version: str = Field(..., min_length=1, max_length=100)
+    lease_token: UUID
+    result_id: UUID
+    readiness_score: int = Field(..., ge=0, le=100)
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    risk_level: str = Field(..., min_length=1, max_length=32)
+    explanation: str = Field(..., min_length=1, max_length=65535)
+    suggested_action: str = Field(..., min_length=1, max_length=65535)
+
+    class Config:
+        extra = "forbid"
+
+
+class DurableFailRequest(BaseModel):
+    worker_id: str = Field(..., min_length=1, max_length=255)
+    lease_token: UUID
+    failure_code: str = Field(..., min_length=1, max_length=100)
+    error_type: str = Field(..., min_length=1, max_length=100)
+    retry_delay_seconds: int = Field(default=5, ge=0, le=3600)
+    terminal_failure: bool = False
+
+    class Config:
+        extra = "forbid"
+
+
+class DurableWorkerRegisterRequest(BaseModel):
+    worker_id: str = Field(..., min_length=1, max_length=255)
+    worker_version: str = Field(..., min_length=1, max_length=100)
+    capacity: int = Field(default=1, ge=1, le=64)
+
+    class Config:
+        extra = "forbid"
+
+
+class DurableWorkerHeartbeatRequest(BaseModel):
+    worker_id: str = Field(..., min_length=1, max_length=255)
+    lease_token: UUID
+    active_slots: int = Field(..., ge=0, le=64)
+
+    class Config:
+        extra = "forbid"
+
+
+class DurableWorkerDrainRequest(BaseModel):
+    worker_id: str = Field(..., min_length=1, max_length=255)
+    lease_token: UUID
+
+    class Config:
+        extra = "forbid"
 
 
 @app.on_event("startup")
@@ -1793,8 +1869,154 @@ def _directus_processing_ready() -> bool:
     return True
 
 
+def _durable_settings() -> DurableSettings:
+    if not DURABLE_PROCESSING_ENABLED:
+        raise DurableConfigurationError("durable processing is disabled")
+    return DurableSettings.from_env(role="api")
+
+
+def _durable_coordinator():
+    global _DURABLE_COORDINATOR
+    if _DURABLE_COORDINATOR is not None:
+        return _DURABLE_COORDINATOR
+    settings = _durable_settings()
+    if directus is None:
+        raise DurableConfigurationError("Directus coordinator is unavailable")
+    try:
+        import psycopg
+        from durable_coordinator import DurableCoordinator
+        from processing import PostgresProcessingRepository
+        from processing_commit import PostgresProcessingResultCommitter
+    except ImportError as exc:
+        raise DurableConfigurationError("durable processing dependencies are unavailable") from exc
+    connection_factory = lambda: psycopg.connect(settings.database_dsn)
+    repository = PostgresProcessingRepository(connection_factory)
+    _DURABLE_COORDINATOR = DurableCoordinator(
+        repository=repository,
+        directus=directus,
+        committer=PostgresProcessingResultCommitter(connection_factory),
+        internal_secret=settings.internal_secret,
+        processing_version=settings.processing_version,
+        lease_seconds=settings.lease_seconds,
+        heartbeat_seconds=settings.heartbeat_seconds,
+    )
+    return _DURABLE_COORDINATOR
+
+
+def _durable_processing_ready() -> bool:
+    if not DURABLE_PROCESSING_ENABLED:
+        return True
+    try:
+        _durable_coordinator().check_ready()
+    except Exception as exc:
+        logger.warning("durable_readiness_failed error_type=%s", type(exc).__name__)
+        return False
+    return True
+
+
 def _public_readiness_response(*, ready: bool) -> JSONResponse:
     return JSONResponse(status_code=200 if ready else 503, content={"ready": ready})
+
+
+def _authorized_durable_scan(scan_id: str, authenticated_user_id: Any) -> dict[str, Any]:
+    scan_context = _resolve_scan_auth_context(scan_id)
+    _authorize_scan_access(scan_context, authenticated_user_id)
+    return _resolve_scan_context(scan_id)
+
+
+def _process_scan_durable(scan_id: str, authenticated_user_id: Any) -> JSONResponse:
+    try:
+        coordinator = _durable_coordinator()
+        scan_context = _authorized_durable_scan(scan_id, authenticated_user_id)
+        current_status = str(scan_context.get("status") or "").strip()
+        if current_status == SCAN_STATUS_COMPLETED:
+            return _build_scan_result_response(
+                ok=True,
+                scan_id=scan_id,
+                status="already_completed",
+                status_code=200,
+            )
+        if current_status == SCAN_STATUS_PROCESSING:
+            return _build_scan_result_response(
+                ok=True,
+                scan_id=scan_id,
+                status="already_processing",
+                status_code=202,
+            )
+        if current_status != SCAN_STATUS_MEDIA_READY:
+            return _build_scan_result_response(
+                ok=False,
+                scan_id=scan_id,
+                error="scan_not_ready",
+                current_status=current_status,
+                status_code=409,
+            )
+        _ensure_scan_media_ready(scan_id)
+        submission = coordinator.submit_authorized(
+            scan_context=scan_context,
+            requester_user_id=authenticated_user_id,
+        )
+        logger.info("durable_job_accepted status=%s", submission.job.status.value)
+        return _build_scan_result_response(
+            ok=True,
+            scan_id=scan_id,
+            status="accepted" if submission.created else submission.job.status.value,
+            status_code=202,
+        )
+    except DurableConfigurationError as exc:
+        logger.warning("durable_submission_configuration_failed error_type=%s", type(exc).__name__)
+        return _build_scan_result_response(
+            ok=False,
+            scan_id=scan_id,
+            error="durable_processing_unavailable",
+            status_code=503,
+        )
+    except HTTPException as exc:
+        error = "scan_not_found" if exc.status_code == 404 else "durable_processing_unavailable"
+        if exc.status_code == 409:
+            error = str(exc.detail)
+        return _build_scan_result_response(
+            ok=False,
+            scan_id=scan_id,
+            error=error,
+            status_code=exc.status_code,
+        )
+    except Exception as exc:
+        logger.warning("durable_submission_failed error_type=%s", type(exc).__name__)
+        return _build_scan_result_response(
+            ok=False,
+            scan_id=scan_id,
+            error="durable_processing_unavailable",
+            status_code=503,
+        )
+
+
+def _require_durable_internal_access(
+    x_ai_internal_secret: str | None = Header(default=None),
+) -> None:
+    if not DURABLE_PROCESSING_ENABLED:
+        raise HTTPException(status_code=404, detail="not_found")
+    try:
+        settings = _durable_settings()
+    except DurableConfigurationError:
+        raise HTTPException(status_code=503, detail="durable_processing_unavailable") from None
+    from durable_coordinator import verify_internal_secret
+
+    if not verify_internal_secret(x_ai_internal_secret, settings.internal_secret):
+        raise HTTPException(status_code=401, detail="invalid_internal_authorization")
+
+
+def _internal_job_payload(job: Any) -> dict[str, Any]:
+    return {
+        "job_id": str(job.id),
+        "scan_id": job.scan_id,
+        "processing_version": job.processing_version,
+        "requester_user_id": job.requester_user_id,
+        "member_id": job.member_id,
+        "business_profile_id": job.business_profile_id,
+        "trace_id": job.trace_id,
+        "status": job.status.value,
+    }
 
 
 def _identifier_payload(scan_context: dict) -> dict:
@@ -3355,6 +3577,9 @@ def readiness():
         logger.warning("readiness_required_model_unavailable")
         return _public_readiness_response(ready=False)
 
+    if not _durable_processing_ready():
+        return _public_readiness_response(ready=False)
+
     return _public_readiness_response(ready=True)
 
 
@@ -3387,6 +3612,208 @@ def debug_scan(scan_id: str):
 
 if DEBUG_SCAN_ENDPOINT_ENABLED:
     app.get("/debug/scan/{scan_id}")(debug_scan)
+
+
+@app.get("/process/status/{scan_id}")
+def durable_process_status(
+    scan_id: str,
+    authorization: str | None = Header(default=None),
+):
+    if not DURABLE_PROCESSING_ENABLED:
+        raise HTTPException(status_code=404, detail="not_found")
+    normalized_scan_id = scan_id.strip()
+    if not normalized_scan_id or len(normalized_scan_id) > 255:
+        raise HTTPException(status_code=404, detail="process_status_not_found")
+    authenticated_user_id = _authenticate_process_user(authorization, normalized_scan_id)
+    _authorized_durable_scan(normalized_scan_id, authenticated_user_id)
+    try:
+        job = _durable_coordinator().public_status(
+            scan_id=normalized_scan_id,
+            processing_version=_durable_settings().processing_version,
+        )
+    except Exception as exc:
+        logger.warning("durable_status_lookup_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=404, detail="process_status_not_found") from exc
+    return {"scan_id": normalized_scan_id, "status": job.status.value}
+
+
+@app.post(
+    "/internal/processing/jobs/{job_id}/claim",
+    dependencies=[Depends(_require_durable_internal_access)],
+)
+def internal_processing_claim(job_id: UUID, req: DurableClaimRequest):
+    try:
+        state, claim, context = _durable_coordinator().claim(
+            job_id=job_id,
+            worker_id=req.worker_id,
+            processing_version=req.processing_version,
+            trace_id=req.trace_id,
+        )
+    except Exception as exc:
+        logger.warning("internal_job_claim_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="processing_coordinator_unavailable") from exc
+    if claim is None:
+        return {"status": state, "job_id": str(job_id)}
+    job_payload = _internal_job_payload(claim.job)
+    job_payload.update(
+        {
+            "status": "processing",
+            "lease_token": str(claim.attempt.lease_token),
+            "attempt_number": claim.attempt.attempt_number,
+            "analysis_context": {
+                "task_metrics": context.get("task_metrics") if context else None,
+                "expected_phrase": context.get("expected_phrase") if context else None,
+                "baseline": context.get("baseline") if context else None,
+            },
+        }
+    )
+    return job_payload
+
+
+@app.post(
+    "/internal/processing/jobs/{job_id}/heartbeat",
+    dependencies=[Depends(_require_durable_internal_access)],
+)
+def internal_processing_heartbeat(job_id: UUID, req: DurableHeartbeatRequest):
+    try:
+        job = _durable_coordinator().heartbeat(
+            job_id=job_id,
+            worker_id=req.worker_id,
+            lease_token=req.lease_token,
+        )
+    except Exception as exc:
+        logger.warning("internal_job_heartbeat_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=409, detail="processing_lease_lost") from exc
+    return {"status": job.status.value, "job_id": str(job.id)}
+
+
+@app.get(
+    "/internal/processing/jobs/{job_id}/input/{asset_role}",
+    dependencies=[Depends(_require_durable_internal_access)],
+)
+def internal_processing_input(
+    job_id: UUID,
+    asset_role: str,
+    x_ai_worker_id: str | None = Header(default=None),
+    x_ai_lease_token: UUID | None = Header(default=None),
+):
+    if not x_ai_worker_id or x_ai_lease_token is None:
+        raise HTTPException(status_code=401, detail="processing_lease_required")
+    try:
+        content, content_type = _durable_coordinator().read_asset(
+            job_id=job_id,
+            worker_id=x_ai_worker_id,
+            lease_token=x_ai_lease_token,
+            asset_role=asset_role,
+        )
+    except Exception as exc:
+        logger.warning("internal_asset_read_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=409, detail="asset_not_available") from exc
+    return Response(content=content, media_type=content_type)
+
+
+@app.post(
+    "/internal/processing/jobs/{job_id}/commit",
+    dependencies=[Depends(_require_durable_internal_access)],
+)
+def internal_processing_commit(job_id: UUID, req: DurableCommitRequest):
+    try:
+        from processing_commit import ValidatedResultPayload
+
+        result = ValidatedResultPayload(
+            {
+                "readiness_score": req.readiness_score,
+                "confidence": req.confidence,
+                "risk_level": req.risk_level,
+                "explanation": req.explanation,
+                "suggested_action": req.suggested_action,
+            }
+        )
+        response = _durable_coordinator().commit(
+            job_id=job_id,
+            scan_id=req.scan_id,
+            processing_version=req.processing_version,
+            lease_token=req.lease_token,
+            result_id=req.result_id,
+            result=result,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_result") from exc
+    except Exception as exc:
+        logger.warning("internal_job_commit_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=409, detail="processing_commit_rejected") from exc
+    return {"status": response.status, "result_id": response.result_ref}
+
+
+@app.post(
+    "/internal/processing/jobs/{job_id}/fail",
+    dependencies=[Depends(_require_durable_internal_access)],
+)
+def internal_processing_fail(job_id: UUID, req: DurableFailRequest):
+    try:
+        job = _durable_coordinator().fail(
+            job_id=job_id,
+            worker_id=req.worker_id,
+            lease_token=req.lease_token,
+            failure_code=req.failure_code,
+            error_type=req.error_type,
+            retry_delay_seconds=req.retry_delay_seconds,
+            terminal_failure=req.terminal_failure,
+        )
+    except Exception as exc:
+        logger.warning("internal_job_fail_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=409, detail="processing_failure_rejected") from exc
+    return {"status": job.status.value, "job_id": str(job.id)}
+
+
+@app.post(
+    "/internal/processing/workers/register",
+    dependencies=[Depends(_require_durable_internal_access)],
+)
+def internal_worker_register(req: DurableWorkerRegisterRequest):
+    try:
+        worker = _durable_coordinator().register_worker(
+            worker_id=req.worker_id,
+            worker_version=req.worker_version,
+            capacity=req.capacity,
+        )
+    except Exception as exc:
+        logger.warning("internal_worker_register_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="worker_registration_unavailable") from exc
+    return {"worker_id": worker.worker_id, "lease_token": str(worker.lease_token), "capacity": worker.capacity}
+
+
+@app.post(
+    "/internal/processing/workers/heartbeat",
+    dependencies=[Depends(_require_durable_internal_access)],
+)
+def internal_worker_heartbeat(req: DurableWorkerHeartbeatRequest):
+    try:
+        worker = _durable_coordinator().heartbeat_worker(
+            worker_id=req.worker_id,
+            lease_token=req.lease_token,
+            active_slots=req.active_slots,
+        )
+    except Exception as exc:
+        logger.warning("internal_worker_heartbeat_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=409, detail="worker_liveness_lost") from exc
+    return {"worker_id": worker.worker_id, "active_slots": worker.active_slots, "draining": worker.draining}
+
+
+@app.post(
+    "/internal/processing/workers/drain",
+    dependencies=[Depends(_require_durable_internal_access)],
+)
+def internal_worker_drain(req: DurableWorkerDrainRequest):
+    try:
+        worker = _durable_coordinator().drain_worker(
+            worker_id=req.worker_id,
+            lease_token=req.lease_token,
+        )
+    except Exception as exc:
+        logger.warning("internal_worker_drain_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=409, detail="worker_liveness_lost") from exc
+    return {"worker_id": worker.worker_id, "draining": worker.draining}
 
 
 @app.get("/baseline/status", response_model=BaselineStatusResponse)
@@ -3544,6 +3971,9 @@ def process_scan(
         elif exc.status_code == 403:
             error = "active_membership_required"
         return _build_scan_result_response(ok=False, scan_id=scan_id, error=error, status_code=exc.status_code)
+
+    if DURABLE_PROCESSING_ENABLED:
+        return _process_scan_durable(scan_id, authenticated_user_id)
 
     raw_status = scan_context.get("status")
     current_status = raw_status.strip() if isinstance(raw_status, str) else ""
