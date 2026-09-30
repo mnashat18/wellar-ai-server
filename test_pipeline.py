@@ -9,7 +9,7 @@ import time
 import types
 from contextlib import ExitStack
 from concurrent.futures import InvalidStateError
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from baseline import (
     baseline_ready_for_personalized_scoring,
@@ -631,6 +631,35 @@ class _FakeAudioLibrosa:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_health_reports_build_and_model_metadata(self):
+        with patch.dict(os.environ, {"APP_BUILD_SHA": "a" * 40, "APP_BUILD_VERSION": "test-build"}):
+            payload = main.health()
+
+        self.assertEqual(payload["server_build_sha"], "a" * 40)
+        self.assertEqual(payload["server_build_version"], "test-build")
+        self.assertEqual(payload["ai_model_version"], main.MODEL_VERSION)
+
+    def test_quality_decision_diagnostics_are_not_added_to_persisted_payload(self):
+        quality_result = {
+            "media_quality": {
+                "video": {
+                    "present": True,
+                    "usable": True,
+                    "warnings": ["video_blurry"],
+                    "decision_warnings": ["video_blurry"],
+                    "evidence_blocking_warnings": [],
+                }
+            }
+        }
+
+        persisted = main._quality_for_persistence(quality_result)
+
+        self.assertEqual(
+            persisted["media_quality"]["video"],
+            {"present": True, "usable": True, "warnings": ["video_blurry"]},
+        )
+        self.assertIn("decision_warnings", quality_result["media_quality"]["video"])
+
     def test_two_qualified_scans_remain_inactive_baseline(self):
         baseline = None
         signals = {

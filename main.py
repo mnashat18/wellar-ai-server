@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import multiprocessing
 from datetime import datetime, timezone
 import math
@@ -28,7 +29,7 @@ from baseline import (
     baseline_status_payload,
     evaluate_baseline_eligibility,
 )
-from config import MODEL_VERSION
+from config import MODEL_VERSION, server_build_sha, server_build_version
 from directus_client import DirectusClient
 from logger import get_logger
 from ml.features import features_from_signals, vector_from_features
@@ -2723,6 +2724,26 @@ def _required_full_multimodal_evidence_failure(
     return None
 
 
+def _quality_for_persistence(quality_result: dict[str, Any]) -> dict[str, Any]:
+    """Keep decision diagnostics available in memory without expanding stored schema."""
+    persisted = dict(quality_result)
+    media_quality = quality_result.get("media_quality")
+    if isinstance(media_quality, dict):
+        persisted["media_quality"] = {
+            key: (
+                {
+                    field: value
+                    for field, value in summary.items()
+                    if field not in {"decision_warnings", "evidence_blocking_warnings"}
+                }
+                if isinstance(summary, dict)
+                else summary
+            )
+            for key, summary in media_quality.items()
+        }
+    return persisted
+
+
 def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     total_started = time.perf_counter()
     _log_step(scan_id, "validation_start")
@@ -2990,6 +3011,47 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             terminal_failure_reason = FAILURE_REASON_ANALYSIS_EXCEPTION
             terminal_reason = "analysis_worker_error"
         else:
+            media_quality = quality_result.get("media_quality") or {}
+            required_modalities = [
+                modality
+                for modality, required in (
+                    ("video", VALIDATION_POLICY.require_video),
+                    ("audio", VALIDATION_POLICY.require_audio),
+                    ("image", VALIDATION_POLICY.require_image),
+                )
+                if required
+            ]
+            diagnostic_modalities = {
+                modality: {
+                    key: (media_quality.get(modality) or {}).get(key)
+                    for key in (
+                        "present",
+                        "score",
+                        "warnings",
+                        "decision_warnings",
+                        "evidence_blocking_warnings",
+                        "usable",
+                        "weak",
+                        "strong",
+                    )
+                }
+                for modality in ("video", "audio", "image")
+            }
+            usable_modalities = [
+                modality
+                for modality, details in media_quality.items()
+                if modality in {"video", "audio", "image"} and details.get("usable")
+            ]
+            logger.info(
+                "[QUALITY_DECISION] scan_id=%s modalities=%s required_modalities=%s "
+                "usable_modalities=%s timed_out_modalities=%s analyzer_error_modalities=%s",
+                scan_id,
+                json.dumps(diagnostic_modalities, sort_keys=True, separators=(",", ":")),
+                json.dumps(required_modalities, separators=(",", ":")),
+                json.dumps(usable_modalities, separators=(",", ":")),
+                json.dumps(timed_out_modalities, separators=(",", ":")),
+                json.dumps(analyzer_error_modalities, separators=(",", ":")),
+            )
             terminal_failure_reason, _required_modalities = _required_modality_gate(
                 quality_result,
                 timed_out_modalities=timed_out_modalities,
@@ -3182,7 +3244,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
 
         internal_analysis = sanitize_payload(
             {
-                "quality": quality_result,
+                "quality": _quality_for_persistence(quality_result),
                 "signals": raw_signals,
                 "ml": ml_result,
                 "baseline_status_before": baseline_status,
@@ -3343,7 +3405,13 @@ def process_scan_background(scan_id: str) -> None:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "status": "alive"}
+    return {
+        "ok": True,
+        "status": "alive",
+        "server_build_sha": server_build_sha(),
+        "server_build_version": server_build_version(),
+        "ai_model_version": MODEL_VERSION,
+    }
 
 
 @app.get("/ready")

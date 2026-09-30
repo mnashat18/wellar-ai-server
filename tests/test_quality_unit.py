@@ -83,7 +83,18 @@ class QualityUnitTests(unittest.TestCase):
         self.assertLessEqual(result["media_quality"]["aggregate_quality"], 1.0)
         for name in ("video", "audio", "image"):
             modality = result["media_quality"][name]
-            self.assertEqual(set(modality.keys()), {"present", "usable", "weak", "score", "warnings"})
+            self.assertEqual(
+                set(modality.keys()),
+                {
+                    "present",
+                    "usable",
+                    "weak",
+                    "score",
+                    "warnings",
+                    "decision_warnings",
+                    "evidence_blocking_warnings",
+                },
+            )
             self.assertIsInstance(modality["present"], bool)
             self.assertIsInstance(modality["usable"], bool)
             self.assertIsInstance(modality["weak"], bool)
@@ -221,6 +232,26 @@ class QualityUnitTests(unittest.TestCase):
                 self.assertFalse(media["weak"])
                 self.assertIn(warning, media["warnings"])
                 self.assertIn(warning, result["warnings"])
+
+    def test_internal_quality_summary_exposes_decision_and_blocking_warnings(self):
+        signals = {
+            "video": _signal("video", score=0.65, details_overrides={"visual_warnings": ["video_blurry"]}),
+            "voice": _signal("audio", score=0.92),
+            "camera": _signal("image", score=0.86),
+        }
+        result = quality.assess_quality(signals)
+        video = result["media_quality"]["video"]
+
+        self.assertEqual(video["decision_warnings"], ["video_blurry"])
+        self.assertEqual(video["evidence_blocking_warnings"], [])
+        self.assertTrue(video["usable"])
+
+        signals["video"]["details"]["visual_warnings"] = ["face_not_visible"]
+        result = quality.assess_quality(signals)
+        video = result["media_quality"]["video"]
+        self.assertEqual(video["decision_warnings"], ["face_not_visible"])
+        self.assertEqual(video["evidence_blocking_warnings"], ["face_not_visible"])
+        self.assertFalse(video["usable"])
 
     def test_evidence_blocking_warnings_remain_unusable(self):
         cases = [

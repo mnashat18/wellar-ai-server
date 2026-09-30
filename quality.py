@@ -300,6 +300,7 @@ def _modality_summary(
         "score": score,
         "warnings": public_warnings,
         "decision_warnings": decision_warnings,
+        "evidence_blocking_warnings": evidence_blocking_warnings,
         "details": details,
     }
 
@@ -459,6 +460,8 @@ def assess_quality(signals: dict | None, task: Any = None, *, speech_required: b
                 "weak": video["weak"],
                 "score": safe_number(video["score"]),
                 "warnings": video["warnings"],
+                "decision_warnings": video["decision_warnings"],
+                "evidence_blocking_warnings": video["evidence_blocking_warnings"],
             },
             "audio": {
                 "present": audio["present"],
@@ -466,6 +469,8 @@ def assess_quality(signals: dict | None, task: Any = None, *, speech_required: b
                 "weak": audio["weak"],
                 "score": safe_number(audio["score"]),
                 "warnings": audio["warnings"],
+                "decision_warnings": audio["decision_warnings"],
+                "evidence_blocking_warnings": audio["evidence_blocking_warnings"],
             },
             "image": {
                 "present": image["present"],
@@ -473,6 +478,8 @@ def assess_quality(signals: dict | None, task: Any = None, *, speech_required: b
                 "weak": image["weak"],
                 "score": safe_number(image["score"]),
                 "warnings": image["warnings"],
+                "decision_warnings": image["decision_warnings"],
+                "evidence_blocking_warnings": image["evidence_blocking_warnings"],
             },
         },
     }

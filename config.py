@@ -1,4 +1,5 @@
 import os
+import string
 import random
 import numpy as np
 try:
@@ -46,6 +47,23 @@ def _seed_random_generators(seed: int) -> None:
 
 
 MODEL_VERSION = "cie_v1_2"
+
+
+def server_build_sha() -> str:
+    """Return deployment-provided build identity without inspecting the host."""
+    for name in ("APP_BUILD_SHA", "GIT_COMMIT_SHA", "RENDER_GIT_COMMIT", "SOURCE_COMMIT"):
+        value = os.getenv(name, "").strip()
+        if 7 <= len(value) <= 64 and all(character in string.hexdigits for character in value):
+            return value
+    return "unknown"
+
+
+def server_build_version() -> str:
+    value = os.getenv("APP_BUILD_VERSION", "").strip()
+    allowed = string.ascii_letters + string.digits + "._+-"
+    if value and len(value) <= 64 and all(character in allowed for character in value):
+        return value
+    return "unknown"
 REQUIRE_LOCAL_MODEL = _env_bool("REQUIRE_LOCAL_MODEL", False)
 
 LABELS = ["High Risk", "Elevated Fatigue", "Low Focus", "Stable"]

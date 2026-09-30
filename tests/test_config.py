@@ -12,6 +12,11 @@ CONFIG_ENV_KEYS = {
     "MAX_DOWNLOAD_BYTES",
     "ML_MODEL_PATH",
     "BASELINE_PATH",
+    "APP_BUILD_SHA",
+    "GIT_COMMIT_SHA",
+    "RENDER_GIT_COMMIT",
+    "SOURCE_COMMIT",
+    "APP_BUILD_VERSION",
 }
 
 
@@ -47,6 +52,20 @@ def config_env(**env):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_server_build_sha_uses_configured_deployment_value(self):
+        configured_sha = "a" * 40
+        with config_env(APP_BUILD_SHA=configured_sha) as config:
+            self.assertEqual(config.server_build_sha(), configured_sha)
+
+    def test_server_build_sha_returns_unknown_when_unset(self):
+        with config_env(
+            APP_BUILD_SHA=None,
+            GIT_COMMIT_SHA=None,
+            RENDER_GIT_COMMIT=None,
+            SOURCE_COMMIT=None,
+        ) as config:
+            self.assertEqual(config.server_build_sha(), "unknown")
+
     def test_require_local_model_accepts_true_values(self):
         for value in ["1", "true", "TRUE", "t", "yes", "y", "on", " On "]:
             with self.subTest(value=value):
